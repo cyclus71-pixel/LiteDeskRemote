@@ -7,10 +7,10 @@
 #include "crypto_win.h"
 #include "security.h"
 #include "../util/log.h"
-
 #include "../util/codec.h"
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -24,7 +24,7 @@ const wchar_t* kContainer = L"LiteDesk-Host-Identity";
 const wchar_t* kProvName = MS_ENH_RSA_AES_PROV_W;
 const DWORD kProvType = PROV_RSA_AES;
 
-// RAII kecil untuk handle provider (HCRYPTPROV bukan pointer → tak bisa unique_ptr).
+// RAII kecil untuk handle provider (HCRYPTPROV bukan pointer -> tak bisa unique_ptr).
 struct CryptoProv {
     HCRYPTPROV h = 0;
     bool ok = false;
@@ -42,7 +42,7 @@ bool AcquireContainer(CryptoProv& out, bool* created) {
         out.ok = true;
         return true;
     }
-    if (GetLastError() == NTE_BAD_KEYSET) {
+    if (GetLastError() == static_cast<DWORD>(NTE_BAD_KEYSET)) {
         if (CryptAcquireContextW(&h, kContainer, kProvName, kProvType, CRYPT_NEWKEYSET)) {
             if (created) *created = true;
             out.h = h;
@@ -59,11 +59,6 @@ std::vector<uint8_t> ReadFileBytes(const std::wstring& path) {
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
                                 std::istreambuf_iterator<char>());
 }
-
-struct CertHolder {
-    PCCERT_CONTEXT cert = nullptr;
-    ~CertHolder() { if (cert) CertFreeCertificateContext(cert); }
-};
 
 } // namespace
 
@@ -130,14 +125,14 @@ std::unique_ptr<HostIdentity> HostIdentity::LoadOrCreate(const std::wstring& sec
         CERT_NAME_BLOB blob{static_cast<DWORD>(nameBlob.size()), nameBlob.data()};
 
         // EKU: Server Auth + Client Auth.
-        CERT_ENHKEY_USAGE eku;
+        CERT_ENHKEY_USAGE eku{};
         LPSTR usage[2] = {const_cast<LPSTR>(szOID_PKIX_KP_SERVER_AUTH),
                           const_cast<LPSTR>(szOID_PKIX_KP_CLIENT_AUTH)};
         eku.cUsageIdentifier = 2;
         eku.rgpszUsageIdentifier = usage;
         DWORD ekuLen = 0;
         if (!CryptEncodeObject(X509_ASN_ENCODING, X509_ENHANCED_KEY_USAGE, &eku,
-                               nullptr, &ekuLen)) {
+                               nullptr, &ekuLen) || ekuLen == 0) {
             if (err) *err = "gagal encode EKU";
             return nullptr;
         }
@@ -147,38 +142,34 @@ std::unique_ptr<HostIdentity> HostIdentity::LoadOrCreate(const std::wstring& sec
             if (err) *err = "gagal encode EKU (2)";
             return nullptr;
         }
-        CERT_EXTENSION exts[1];
-        std::memset(&exts[0], 0, sizeof(exts[0]));
+        CERT_EXTENSION exts[1]{};
         exts[0].pszObjId = const_cast<LPSTR>(szOID_ENHANCED_KEY_USAGE);
         exts[0].fCritical = FALSE;
         exts[0].Value.cbData = ekuLen;
         exts[0].Value.pbData = ekuBlob.data();
         CERT_EXTENSIONS extensions{1, exts};
 
-        SYSTEMTIME st, et;
+        SYSTEMTIME st{}, et{};
         GetSystemTime(&st);
         et = st;
         et.wYear += 10;
 
-        CRYPT_ALGORITHM_IDENTIFIER sigAlg;
-        std::memset(&sigAlg, 0, sizeof(sigAlg));
-        sigAlg.pszObjId = const_cast<LPSTR>(szOID_RSA_SHA256RSA);
-
+        // Biarkan pSignatureAlgorithm = nullptr agar CryptoAPI memilih algoritma default
+        // yang sesuai dengan kunci container (RSA-2048) tanpa memicu NTE_BAD_FLAGS.
         PCCERT_CONTEXT cert = CertCreateSelfSignCertificate(
-            prov.h, &blob, 0, nullptr, &sigAlg, &st, &et, &extensions);
+            prov.h, &blob, 0, nullptr, nullptr, &st, &et, &extensions);
         if (!cert) {
             DWORD e = GetLastError();
-            char buf[64];
-            snprintf(buf, sizeof(buf), "gagal membuat sertifikat self-signed (err=%lu)",
-                     static_cast<unsigned long>(e));
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "gagal membuat sertifikat self-signed (err=%lu)",
+                          static_cast<unsigned long>(e));
             if (err) *err = buf;
             return nullptr;
         }
         id->cert_ = cert;
 
         // Ikatan kunci: CERT_KEY_PROV_INFO agar Schannel menemukan kunci privat.
-        CRYPT_KEY_PROV_INFO kpi;
-        std::memset(&kpi, 0, sizeof(kpi));
+        CRYPT_KEY_PROV_INFO kpi{};
         kpi.pwszContainerName = const_cast<LPWSTR>(kContainer);
         kpi.pwszProvName = const_cast<LPWSTR>(kProvName);
         kpi.dwProvType = kProvType;
@@ -195,8 +186,7 @@ std::unique_ptr<HostIdentity> HostIdentity::LoadOrCreate(const std::wstring& sec
         LLOG_I("identitas TLS host baru dibuat (RSA-2048, 10 tahun)");
     } else {
         // Pastikan properti KEY_PROV_INFO terpasang (bila DER ada tetapi container baru).
-        CRYPT_KEY_PROV_INFO kpi;
-        std::memset(&kpi, 0, sizeof(kpi));
+        CRYPT_KEY_PROV_INFO kpi{};
         kpi.pwszContainerName = const_cast<LPWSTR>(kContainer);
         kpi.pwszProvName = const_cast<LPWSTR>(kProvName);
         kpi.dwProvType = kProvType;
