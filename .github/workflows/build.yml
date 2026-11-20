@@ -1,0 +1,25 @@
+name: Build LiteDeskRemote (Windows)
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and run tests
+        shell: pwsh
+        run: .\scripts\run_tests.ps1
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteDeskRemote-Windows
+          path: |
+            build/Release/ldhost.exe
+            build/Release/ldviewer.exe
