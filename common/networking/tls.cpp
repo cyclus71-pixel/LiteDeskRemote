@@ -1,6 +1,16 @@
 // tls.cpp — implementasi Schannel: handshake client/server, enkripsi/dekripsi record,
 // penanganan EXTRA/INCOMPLETE/RENEGOTIATE. Pola implementasi mengikuti praktik standar
 // SSPI (InitializeSecurityContext/AcceptSecurityContext streaming + QueryContextAttributes).
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef SECURITY_WIN32
+#define SECURITY_WIN32
+#endif
+
 #include "tls.h"
 #include "../security/crypto_win.h"
 #include "../util/codec.h"
@@ -9,24 +19,36 @@
 
 #include <cstring>
 #include <mutex>
+#include <vector>
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#define SECURITY_WIN32
 #include <windows.h>
 #include <wincrypt.h>
+#include <security.h>
+#include <schannel.h>
+#include <sspi.h>
 
 // Kompatibilitas nama flag antar SDK: MS SDK = *_ALLOCATED_MEMORY, mingw-w64 = *_ALLOCATE_MEMORY.
 #ifndef ISC_REQ_ALLOCATED_MEMORY
+#ifdef ISC_REQ_ALLOCATE_MEMORY
+#define ISC_REQ_ALLOCATED_MEMORY ISC_REQ_ALLOCATE_MEMORY
+#else
 #define ISC_REQ_ALLOCATED_MEMORY 0x00000100
 #endif
-#ifndef ASC_REQ_ALLOCATED_MEMORY
-#define ASC_REQ_ALLOCATED_MEMORY 0x00000100
 #endif
 
-// Kompatibilitas antar SDK: nama field SCHANNEL_CRED dan nama fungsi ASC berbeda
-// antara Windows SDK (MSVC) dan mingw-w64.
-#ifdef __MINGW32__
+#ifndef ASC_REQ_ALLOCATED_MEMORY
+#ifdef ASC_REQ_ALLOCATE_MEMORY
+#define ASC_REQ_ALLOCATED_MEMORY ASC_REQ_ALLOCATE_MEMORY
+#else
+#define ASC_REQ_ALLOCATED_MEMORY 0x00000100
+#endif
+#endif
+
+// Di Windows SDK (MSVC), field _SCHANNEL_CRED adalah `paCred` dan fungsi SSPI-nya `AcceptSecurityContext`.
+#if defined(_MSC_VER)
+#define LDR_SC_PA_CREDS paCred
+#define LDR_AcceptSecurityContext AcceptSecurityContext
+#elif defined(__MINGW32__)
 #define LDR_SC_PA_CREDS paCred
 #define LDR_AcceptSecurityContext AcceptSecurityContext
 #else
@@ -45,7 +67,7 @@ constexpr DWORD kServerReqFlags =
     ASC_REQ_SEQUENCE_DETECT | ASC_REQ_REPLAY_DETECT | ASC_REQ_CONFIDENTIALITY |
     ASC_REQ_ALLOCATED_MEMORY | ASC_REQ_STREAM;
 
-// Helper socket (dipakai TlsChannel;TcpSocket milik pemanggil handshake).
+// Helper socket (dipakai TlsChannel; TcpSocket milik pemanggil handshake).
 bool WaitReadableSocket(SOCKET s, int ms) {
     if (s == INVALID_SOCKET) return false;
     fd_set rset;
@@ -80,10 +102,11 @@ CredPtr MakeServerCred(PCCERT_CONTEXT cert, std::string* err) {
     sc.dwVersion = SCHANNEL_CRED_VERSION;
     sc.cCreds = 1;
     sc.LDR_SC_PA_CREDS = const_cast<PCCERT_CONTEXT*>(&cert);
-    // grfEnabledProtocols = 0 → default OS (Win10 1903+/11: TLS 1.2 + 1.3, lama nonaktif).
+    // grfEnabledProtocols = 0 -> default OS (Win10 1903+/11: TLS 1.2 + 1.3, lama nonaktif).
     CredHandle* h = new CredHandle{};
     TimeStamp exp{};
-    SECURITY_STATUS st = AcquireCredentialsHandleW(nullptr, UNISP_NAME_W, SECPKG_CRED_INBOUND,
+    wchar_t pkgName[] = UNISP_NAME_W;
+    SECURITY_STATUS st = AcquireCredentialsHandleW(nullptr, pkgName, SECPKG_CRED_INBOUND,
                                                    nullptr, &sc, nullptr, nullptr, h, &exp);
     if (st != SEC_E_OK) {
         delete h;
@@ -103,7 +126,8 @@ CredPtr MakeClientCred(std::string* err) {
                  SCH_CRED_IGNORE_REVOCATION_OFFLINE;
     CredHandle* h = new CredHandle{};
     TimeStamp exp{};
-    SECURITY_STATUS st = AcquireCredentialsHandleW(nullptr, UNISP_NAME_W, SECPKG_CRED_OUTBOUND,
+    wchar_t pkgName[] = UNISP_NAME_W;
+    SECURITY_STATUS st = AcquireCredentialsHandleW(nullptr, pkgName, SECPKG_CRED_OUTBOUND,
                                                    nullptr, &sc, nullptr, nullptr, h, &exp);
     if (st != SEC_E_OK) {
         delete h;
@@ -152,7 +176,6 @@ void TlsChannel::CloseNotify() {
         }
         (void)st;
         if (outTok.cbBuffer > 0 && tokenBuf[0]) {
-            // kirim token tertutup (best-effort)
             int n = send(s_, reinterpret_cast<const char*>(outTok.pvBuffer), outTok.cbBuffer, 0);
             (void)n;
         }
@@ -181,7 +204,6 @@ bool TlsChannel::Send(const uint8_t* src, size_t n, std::string* err) {
     while (off < n) {
         size_t chunk = (n - off < maxMsg) ? (n - off) : maxMsg;
         std::vector<uint8_t> record(sizes_.cbHeader + chunk + sizes_.cbTrailer);
-        // Salin payload dulu, lalu EncryptMessage mengenkripsi in-place di buffer record.
         std::memcpy(record.data() + sizes_.cbHeader, src + off, chunk);
         SecBuffer bufs[4];
         bufs[0].BufferType = SECBUFFER_STREAM_HEADER;
@@ -217,7 +239,6 @@ int TlsChannel::Recv(uint8_t* dst, size_t cap, std::string* err) {
         plain_.erase(plain_.begin(), plain_.begin() + static_cast<long>(n));
         return static_cast<int>(n);
     }
-    // Dekripsi data yang ada; bila kurang, terima lagi.
     while (true) {
         if (!DecryptPending()) {
             if (err) *err = err_;
@@ -244,18 +265,13 @@ bool TlsChannel::DecryptPending() {
         b.BufferType = SECBUFFER_DATA;
         b.pvBuffer = rawIn_.data();
     }
-    bufs[0].BufferType = SECBUFFER_DATA;
-    bufs[1].BufferType = SECBUFFER_DATA;
-    bufs[2].BufferType = SECBUFFER_DATA;
-    bufs[3].BufferType = SECBUFFER_DATA;
     SecBufferDesc desc{SECBUFFER_VERSION, 4, bufs};
     ULONG qop = 0;
     SECURITY_STATUS st = DecryptMessage(&ctx_, &desc, 0, &qop);
 
-    if (st == SEC_E_INCOMPLETE_MESSAGE) return true; // butuh lebih banyak byte
+    if (st == SEC_E_INCOMPLETE_MESSAGE) return true;
 
     if (st == SEC_I_CONTEXT_EXPIRED) {
-        // clean close: salin DATA bila ada, lalu tandai EOF
         for (ULONG i = 0; i < 4; ++i) {
             if (bufs[i].BufferType == SECBUFFER_DATA && bufs[i].cbBuffer > 0)
                 plain_.insert(plain_.end(), static_cast<uint8_t*>(bufs[i].pvBuffer),
@@ -267,7 +283,6 @@ bool TlsChannel::DecryptPending() {
     }
 
     if (st == SEC_I_RENEGOTIATE) {
-        // Token renegotiasi ada di buffer token; lanjutkan handshake sesuai mode.
         for (ULONG i = 0; i < 4; ++i) {
             if (bufs[i].BufferType == SECBUFFER_TOKEN && bufs[i].cbBuffer > 0) {
                 std::vector<uint8_t> tok(static_cast<uint8_t*>(bufs[i].pvBuffer),
@@ -294,7 +309,6 @@ bool TlsChannel::DecryptPending() {
         return false;
     }
 
-    // SEC_E_OK: cari DATA dan EXTRA.
     std::vector<uint8_t> dataPart, extraPart;
     for (ULONG i = 0; i < 4; ++i) {
         if (bufs[i].BufferType == SECBUFFER_DATA && bufs[i].cbBuffer > 0) {
@@ -327,10 +341,10 @@ SECURITY_STATUS TlsChannel::ServerStep(SecBufferDesc* in, SecBufferDesc* out,
     if (*first) {
         *first = false;
         return LDR_AcceptSecurityContext(cred_, nullptr, in, kServerReqFlags, 0,
-                                      &ctx_, out, attrs, nullptr);
+                                         &ctx_, out, attrs, nullptr);
     }
     return LDR_AcceptSecurityContext(cred_, &ctx_, in, kServerReqFlags, 0,
-                                      &ctx_, out, attrs, nullptr);
+                                     &ctx_, out, attrs, nullptr);
 }
 
 bool TlsChannel::RunHandshake(SECURITY_STATUS (TlsChannel::*fn)(SecBufferDesc*, SecBufferDesc*,
@@ -357,7 +371,6 @@ bool TlsChannel::RunHandshake(SECURITY_STATUS (TlsChannel::*fn)(SecBufferDesc*, 
             continue;
         }
 
-        // kirim token keluar bila ada
         if (outBufs[0].cbBuffer > 0 && outBufs[0].pvBuffer) {
             std::vector<uint8_t> tok(static_cast<uint8_t*>(outBufs[0].pvBuffer),
                                      static_cast<uint8_t*>(outBufs[0].pvBuffer) + outBufs[0].cbBuffer);
@@ -369,7 +382,6 @@ bool TlsChannel::RunHandshake(SECURITY_STATUS (TlsChannel::*fn)(SecBufferDesc*, 
         }
 
         if (st == SEC_I_CONTINUE_NEEDED) {
-            // simpan EXTRA (tail belum terkonsumsi dari rawIn_)
             std::vector<uint8_t> extra;
             for (int i = 0; i < 2; ++i) {
                 if (inBufs[i].BufferType == SECBUFFER_EXTRA && inBufs[i].cbBuffer > 0) {
@@ -383,7 +395,6 @@ bool TlsChannel::RunHandshake(SECURITY_STATUS (TlsChannel::*fn)(SecBufferDesc*, 
         }
 
         if (st == SEC_E_OK) {
-            // handshake selesai; simpan leftover sebagai rawIn_ (data terenkripsi berikutnya)
             std::vector<uint8_t> extra;
             for (int i = 0; i < 2; ++i) {
                 if (inBufs[i].BufferType == SECBUFFER_EXTRA && inBufs[i].cbBuffer > 0) {
@@ -412,7 +423,6 @@ bool TlsChannel::HandshakeClient(SOCKET s, CredHandle* cred, int timeoutMs, std:
     err_.clear();
     if (!RunHandshake(&TlsChannel::ClientStep, timeoutMs, err)) return false;
 
-    // Verifikasi manual: wajib confidentiality; ambil sertifikat remote → SHA-256.
     if ((QueryContextAttributesW(&ctx_, SECPKG_ATTR_STREAM_SIZES, &sizes_)) != SEC_E_OK) {
         if (err) *err = "QueryContextAttributes(STREAM_SIZES) gagal";
         return false;
