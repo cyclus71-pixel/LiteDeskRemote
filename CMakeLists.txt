@@ -88,6 +88,11 @@ if(WIN32)
         WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 WINVER=0x0A00 UNICODE _UNICODE)
     target_link_libraries(ldviewer PRIVATE ldwin)
 
+    if(MSVC)
+        target_link_options(ldhost PRIVATE /MANIFEST:NO)
+        target_link_options(ldviewer PRIVATE /MANIFEST:NO)
+    endif()
+
     add_executable(ldwin_tests
         tests/win/test_win.cpp
         host/session.cpp
@@ -102,7 +107,11 @@ endif()
 add_executable(ldcore_tests tests/core/test_core.cpp)
 target_compile_definitions(ldcore_tests PRIVATE
     $<$<NOT:$<BOOL:${WIN32}>>:LDR_CORE_TEST>)
-target_link_libraries(ldcore_tests PRIVATE ldcore)
+if(WIN32)
+    target_link_libraries(ldcore_tests PRIVATE ldwin)
+else()
+    target_link_libraries(ldcore_tests PRIVATE ldcore)
+endif()
 if(NOT WIN32 AND NOT MSVC)
     find_package(Threads REQUIRED)
     target_link_libraries(ldcore_tests PRIVATE Threads::Threads)
